@@ -511,6 +511,12 @@ app.get("/api/booking/:id/receipt", auth, async (req, res) => {
   }
 });
 
-app.listen(5000, () => {
-  console.log("🚀 Backend running locally at http://localhost:5000 — deployed at https://manyam-tourism-backend-1.onrender.com");
-});
+if (process.env.VERCEL !== "1") {
+  app.listen(5000, () => {
+    console.log(
+      "🚀 Backend running locally at http://localhost:5000 — deployed at https://manyam-tourism-backend-1.onrender.com"
+    );
+  });
+}
+
+export default app;
