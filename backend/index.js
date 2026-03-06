@@ -238,6 +238,10 @@ app.post(
 
 /* ================= PUBLIC ================= */
 
+app.get("/", (_, res) => {
+  res.json({ status: "ok", message: "Manyam Tourism backend is live" });
+});
+
 app.get("/api/hotels", async (_, res) => {
   res.json(await Hotel.find());
 });
