@@ -115,6 +115,29 @@ const buildLooseEmailRegex = (email = "") => {
   return new RegExp(`^\\s*${escapeRegExp(normalized)}\\s*$`, "i");
 };
 
+const ACTIVE_BOOKING_STATUSES = ["pending", "paid", "confirmed"];
+
+const getAvailabilityLevel = (available, total) => {
+  if (available <= 0) return "full";
+  if (total <= 0) return "full";
+
+  const ratio = available / total;
+  return ratio <= 0.3 ? "fast" : "available";
+};
+
+const getMonthParts = (monthValue = "") => {
+  const [yearText, monthText] = String(monthValue || "").split("-");
+  const year = Number(yearText);
+  const month = Number(monthText);
+
+  if (!Number.isInteger(year) || !Number.isInteger(month)) return null;
+  if (month < 1 || month > 12) return null;
+
+  return { year, month };
+};
+
+const toDateOnly = (date) => date.toISOString().split("T")[0];
+
 /* ================= GOOGLE LOGIN ================= */
 
 app.post("/api/auth/google", async (req, res) => {
@@ -246,6 +269,147 @@ app.get("/api/hotels", async (_, res) => {
   res.json(await Hotel.find());
 });
 
+app.get("/api/hotels/:id/availability", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { checkIn, checkOut } = req.query;
+
+    const hotel = await Hotel.findById(id);
+    if (!hotel) {
+      return res.status(404).json({ msg: "Hotel not found" });
+    }
+
+    const checkInDate = new Date(checkIn);
+    const checkOutDate = new Date(checkOut);
+    const hasValidDates =
+      !Number.isNaN(checkInDate.getTime()) &&
+      !Number.isNaN(checkOutDate.getTime()) &&
+      checkOutDate > checkInDate;
+
+    const bookingQuery = hasValidDates
+      ? {
+          hotelId: hotel._id,
+          status: { $in: ACTIVE_BOOKING_STATUSES },
+          checkIn: { $lt: checkOutDate },
+          checkOut: { $gt: checkInDate },
+        }
+      : null;
+
+    const overlappingBookings = bookingQuery
+      ? await Booking.find(bookingQuery).select("roomType")
+      : [];
+
+    const bookedByType = overlappingBookings.reduce((acc, booking) => {
+      const type = booking.roomType;
+      acc[type] = (acc[type] || 0) + 1;
+      return acc;
+    }, {});
+
+    const rooms = (hotel.rooms || []).map((room) => {
+      const total = Number(room.total) || 0;
+      const booked = bookedByType[room.type] || 0;
+      const available = Math.max(total - booked, 0);
+
+      return {
+        type: room.type,
+        price: Number(room.price) || 0,
+        total,
+        booked,
+        available,
+        level: getAvailabilityLevel(available, total),
+      };
+    });
+
+    const totalRooms = rooms.reduce((sum, room) => sum + room.total, 0);
+
+    res.json({
+      hotelId: hotel._id,
+      checkIn: hasValidDates ? checkInDate : null,
+      checkOut: hasValidDates ? checkOutDate : null,
+      totalRooms,
+      rooms,
+    });
+  } catch (err) {
+    console.error("HOTEL AVAILABILITY ERROR:", err);
+    res.status(500).json({ msg: "Server error" });
+  }
+});
+
+app.get("/api/hotels/:id/availability-calendar", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const hotel = await Hotel.findById(id);
+    if (!hotel) return res.status(404).json({ msg: "Hotel not found" });
+
+    const fallbackRoomType = hotel.rooms?.[0]?.type || "";
+    const roomType = String(req.query.roomType || fallbackRoomType).trim();
+    if (!roomType) {
+      return res.status(400).json({ msg: "Room type is required" });
+    }
+
+    const room = (hotel.rooms || []).find((item) => item.type === roomType);
+    if (!room) {
+      return res.status(400).json({ msg: "Invalid room type" });
+    }
+
+    const now = new Date();
+    const defaultMonth = `${now.getUTCFullYear()}-${String(
+      now.getUTCMonth() + 1
+    ).padStart(2, "0")}`;
+    const monthParts = getMonthParts(req.query.month || defaultMonth);
+    if (!monthParts) {
+      return res.status(400).json({ msg: "Invalid month. Use YYYY-MM format" });
+    }
+
+    const { year, month } = monthParts;
+    const monthStart = new Date(Date.UTC(year, month - 1, 1));
+    const monthEnd = new Date(Date.UTC(year, month, 1));
+
+    const bookings = await Booking.find({
+      hotelId: hotel._id,
+      roomType,
+      status: { $in: ACTIVE_BOOKING_STATUSES },
+      checkIn: { $lt: monthEnd },
+      checkOut: { $gt: monthStart },
+    }).select("checkIn checkOut");
+
+    const totalRooms = Number(room.total) || 0;
+    const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+
+    const days = [];
+    for (let day = 1; day <= daysInMonth; day += 1) {
+      const dayStart = new Date(Date.UTC(year, month - 1, day));
+      const dayEnd = new Date(Date.UTC(year, month - 1, day + 1));
+
+      let booked = 0;
+      bookings.forEach((booking) => {
+        const overlaps = booking.checkIn < dayEnd && booking.checkOut > dayStart;
+        if (overlaps) booked += 1;
+      });
+
+      const available = Math.max(totalRooms - booked, 0);
+      days.push({
+        date: toDateOnly(dayStart),
+        total: totalRooms,
+        booked,
+        available,
+        level: getAvailabilityLevel(available, totalRooms),
+      });
+    }
+
+    res.json({
+      hotelId: hotel._id,
+      roomType,
+      month: `${year}-${String(month).padStart(2, "0")}`,
+      totalRooms,
+      days,
+    });
+  } catch (err) {
+    console.error("HOTEL AVAILABILITY CALENDAR ERROR:", err);
+    res.status(500).json({ msg: "Server error" });
+  }
+});
+
 /* ================= BOOKINGS ================= */
 
 
@@ -262,24 +426,58 @@ app.post("/api/bookings", auth, async (req, res) => {
     const room = hotel.rooms.find(r => r.type === roomType);
     if (!room) return res.status(400).json({ msg: "Invalid room type" });
 
+    const checkInDate = new Date(checkIn);
+    const checkOutDate = new Date(checkOut);
+    if (
+      Number.isNaN(checkInDate.getTime()) ||
+      Number.isNaN(checkOutDate.getTime()) ||
+      checkOutDate <= checkInDate
+    ) {
+      return res.status(400).json({ msg: "Invalid booking dates" });
+    }
+
+    const overlappingCount = await Booking.countDocuments({
+      hotelId: hotel._id,
+      roomType,
+      status: { $in: ACTIVE_BOOKING_STATUSES },
+      checkIn: { $lt: checkOutDate },
+      checkOut: { $gt: checkInDate },
+    });
+
+    const totalRooms = Number(room.total) || 0;
+    if (overlappingCount >= totalRooms) {
+      return res.status(400).json({
+        msg: "No vacancies available for selected room type and dates",
+      });
+    }
+
     console.log("ROOM PRICE RAW:", room.price, typeof room.price);
 
-    const amount = Number(room.price);
-    if (!amount || isNaN(amount)) {
+    const amountPerNight = Number(room.price);
+    if (!amountPerNight || Number.isNaN(amountPerNight)) {
       return res.status(400).json({ msg: "Invalid room price" });
     }
+
+    const nights = Math.round(
+      (checkOutDate.getTime() - checkInDate.getTime()) / (24 * 60 * 60 * 1000)
+    );
+    if (!Number.isInteger(nights) || nights <= 0) {
+      return res.status(400).json({ msg: "Invalid number of nights" });
+    }
+
+    const amount = amountPerNight * nights;
 
     const booking = await Booking.create({
       userEmail: req.user.email,
       hotelId,
       roomType,
-      checkIn,
-      checkOut,
-      amount,               // 🔥 GUARANTEED
+      checkIn: checkInDate,
+      checkOut: checkOutDate,
+      amount,
       status: "pending"
     });
 
-    console.log("BOOKING AMOUNT SAVED:", booking.amount);
+    console.log("BOOKING AMOUNT SAVED:", booking.amount, "NIGHTS:", nights, "RATE:", amountPerNight);
 
     res.json(booking);
   } catch (err) {
@@ -419,8 +617,17 @@ app.post("/api/payment/verify", auth, async (req, res) => {
     }
 
     // 3️⃣ Prevent double verification
-    if (booking.status === "paid") {
-      console.log("⚠️ Booking already paid:", bookingId);
+    const currentStatus = String(booking.status || "").toLowerCase();
+    if (currentStatus === "confirmed") {
+      console.log("⚠️ Booking already confirmed:", bookingId);
+      return res.json({ msg: "Already verified", bookingId: booking._id });
+    }
+
+    // Backward compatibility for old "paid" records: upgrade to confirmed.
+    if (currentStatus === "paid") {
+      booking.status = "confirmed";
+      await booking.save();
+      console.log("⚠️ Upgraded paid booking to confirmed:", bookingId);
       return res.json({ msg: "Already verified", bookingId: booking._id });
     }
 
@@ -438,7 +645,7 @@ app.post("/api/payment/verify", auth, async (req, res) => {
     }
 
     // 5️⃣ Update booking (CRITICAL STEP)
-    booking.status = "paid";
+    booking.status = "confirmed";
     booking.paymentId = razorpay_payment_id;
     await booking.save();
 
