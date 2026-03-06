@@ -32,14 +32,54 @@ const ADMIN_EMAIL = "manyamtourism@gmail.com";
   
 import path from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const getFirebaseServiceAccount = () => {
+  const base64Json = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+  if (base64Json) {
+    try {
+      const decoded = Buffer.from(base64Json, "base64").toString("utf8");
+      return JSON.parse(decoded);
+    } catch (err) {
+      console.error("❌ Invalid FIREBASE_SERVICE_ACCOUNT_BASE64:", err.message);
+      process.exit(1);
+    }
+  }
+
+  const inlineJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (inlineJson) {
+    try {
+      return JSON.parse(inlineJson);
+    } catch (err) {
+      console.error("❌ Invalid FIREBASE_SERVICE_ACCOUNT_JSON:", err.message);
+      process.exit(1);
+    }
+  }
+
+  const fileFromEnv = process.env.FIREBASE_SERVICE_ACCOUNT_FILE;
+  const defaultFile = path.join(__dirname, "firebase-service.json");
+  const filePath = fileFromEnv ? path.resolve(fileFromEnv) : defaultFile;
+
+  if (!fs.existsSync(filePath)) {
+    console.error(
+      "❌ Firebase service account not found. Set FIREBASE_SERVICE_ACCOUNT_JSON in env for deployment."
+    );
+    process.exit(1);
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (err) {
+    console.error("❌ Failed to read Firebase service account file:", err.message);
+    process.exit(1);
+  }
+};
+
 admin.initializeApp({
-  credential: admin.credential.cert(
-    path.join(__dirname, "firebase-service.json")
-  )
+  credential: admin.credential.cert(getFirebaseServiceAccount())
 });
 
 /* ================= DATABASE ================= */
