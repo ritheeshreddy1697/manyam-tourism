@@ -10,6 +10,7 @@ import { connectDB } from "./db.js";
 import User from "./models/User.js";
 import Hotel from "./models/Hotel.js";
 import Booking from "./models/Booking.js";
+import RoomAvailabilityOverride from "./models/RoomAvailabilityOverride.js";
 import { generateReceipt } from "./utils/receipt.js";
 import { sendReceiptMail } from "./utils/mailer.js";
 import { upload } from "./utils/cloudinary.js";
@@ -138,6 +139,65 @@ const getMonthParts = (monthValue = "") => {
 
 const toDateOnly = (date) => date.toISOString().split("T")[0];
 
+const toUtcDateStart = (value) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+};
+
+const getDateKeysInRange = (startDate, endDate) => {
+  const keys = [];
+  for (
+    const cursor = new Date(startDate);
+    cursor < endDate;
+    cursor.setUTCDate(cursor.getUTCDate() + 1)
+  ) {
+    keys.push(toDateOnly(cursor));
+  }
+  return keys;
+};
+
+const buildBookedCountByDate = (bookings = [], startDate, endDate) => {
+  const bookedByDate = {};
+
+  bookings.forEach((booking) => {
+    const bookingStart = toUtcDateStart(booking.checkIn);
+    const bookingEnd = toUtcDateStart(booking.checkOut);
+    if (!bookingStart || !bookingEnd || bookingEnd <= bookingStart) return;
+
+    const overlapStart =
+      bookingStart > startDate ? new Date(bookingStart) : new Date(startDate);
+    const overlapEnd = bookingEnd < endDate ? new Date(bookingEnd) : new Date(endDate);
+    if (overlapEnd <= overlapStart) return;
+
+    for (
+      const cursor = new Date(overlapStart);
+      cursor < overlapEnd;
+      cursor.setUTCDate(cursor.getUTCDate() + 1)
+    ) {
+      const dateKey = toDateOnly(cursor);
+      bookedByDate[dateKey] = (bookedByDate[dateKey] || 0) + 1;
+    }
+  });
+
+  return bookedByDate;
+};
+
+const buildOverrideMapByRoomType = (overrides = []) => {
+  const map = {};
+
+  overrides.forEach((override) => {
+    const roomType = String(override.roomType || "").trim();
+    const dateKey = toDateOnly(override.date);
+    if (!roomType || !dateKey) return;
+
+    if (!map[roomType]) map[roomType] = {};
+    map[roomType][dateKey] = Math.max(0, Number(override.total) || 0);
+  });
+
+  return map;
+};
+
 /* ================= GOOGLE LOGIN ================= */
 
 app.post("/api/auth/google", async (req, res) => {
@@ -247,6 +307,88 @@ app.get("/api/hotel/bookings", auth, async (req, res) => {
   }
 });
 
+app.post("/api/hotel/availability-date", auth, async (req, res) => {
+  try {
+    if (req.user.role !== "hotel") return res.sendStatus(403);
+
+    const roomType = String(req.body.roomType || "").trim();
+    const dateText = String(req.body.date || "").trim();
+    const requestedAvailable = Number(req.body.available);
+
+    if (!roomType) {
+      return res.status(400).json({ msg: "Room type is required" });
+    }
+    if (!Number.isFinite(requestedAvailable) || requestedAvailable < 0) {
+      return res.status(400).json({ msg: "Available rooms must be 0 or more" });
+    }
+
+    const dayStart = toUtcDateStart(dateText);
+    if (!dayStart) {
+      return res.status(400).json({ msg: "Invalid date. Use YYYY-MM-DD" });
+    }
+    const dayEnd = new Date(dayStart);
+    dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+
+    const ownerEmail = String(req.user.email || "").trim().toLowerCase();
+    const emailRegex = buildLooseEmailRegex(ownerEmail);
+
+    const hotel = await Hotel.findOne({ ownerEmail: { $regex: emailRegex } });
+    if (!hotel) {
+      return res.status(404).json({ msg: "Hotel profile not found" });
+    }
+
+    const room = (hotel.rooms || []).find((item) => item.type === roomType);
+    if (!room) {
+      return res.status(400).json({ msg: "Invalid room type" });
+    }
+
+    const booked = await Booking.countDocuments({
+      hotelId: hotel._id,
+      roomType,
+      status: { $in: ACTIVE_BOOKING_STATUSES },
+      checkIn: { $lt: dayEnd },
+      checkOut: { $gt: dayStart },
+    });
+
+    const available = Math.max(0, Math.floor(requestedAvailable));
+    const total = booked + available;
+    const baseTotal = Math.max(0, Number(room.total) || 0);
+
+    if (total === baseTotal) {
+      await RoomAvailabilityOverride.findOneAndDelete({
+        hotelId: hotel._id,
+        roomType,
+        date: dayStart,
+      });
+    } else {
+      await RoomAvailabilityOverride.findOneAndUpdate(
+        {
+          hotelId: hotel._id,
+          roomType,
+          date: dayStart,
+        },
+        {
+          $set: { total },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+    }
+
+    res.json({
+      hotelId: hotel._id,
+      roomType,
+      date: toDateOnly(dayStart),
+      booked,
+      available,
+      total,
+      level: getAvailabilityLevel(available, total),
+    });
+  } catch (err) {
+    console.error("HOTEL DATE AVAILABILITY UPDATE ERROR:", err);
+    res.status(500).json({ msg: "Server error" });
+  }
+});
+
 /* ================= IMAGE UPLOAD ================= */
 
 app.post(
@@ -279,11 +421,11 @@ app.get("/api/hotels/:id/availability", async (req, res) => {
       return res.status(404).json({ msg: "Hotel not found" });
     }
 
-    const checkInDate = new Date(checkIn);
-    const checkOutDate = new Date(checkOut);
+    const checkInDate = toUtcDateStart(checkIn);
+    const checkOutDate = toUtcDateStart(checkOut);
     const hasValidDates =
-      !Number.isNaN(checkInDate.getTime()) &&
-      !Number.isNaN(checkOutDate.getTime()) &&
+      !!checkInDate &&
+      !!checkOutDate &&
       checkOutDate > checkInDate;
 
     const bookingQuery = hasValidDates
@@ -296,27 +438,73 @@ app.get("/api/hotels/:id/availability", async (req, res) => {
       : null;
 
     const overlappingBookings = bookingQuery
-      ? await Booking.find(bookingQuery).select("roomType")
+      ? await Booking.find(bookingQuery).select("roomType checkIn checkOut")
       : [];
 
-    const bookedByType = overlappingBookings.reduce((acc, booking) => {
-      const type = booking.roomType;
-      acc[type] = (acc[type] || 0) + 1;
-      return acc;
-    }, {});
+    const overrides = hasValidDates
+      ? await RoomAvailabilityOverride.find({
+          hotelId: hotel._id,
+          date: { $gte: checkInDate, $lt: checkOutDate },
+        }).select("roomType date total")
+      : [];
+
+    const bookingsByType = {};
+    overlappingBookings.forEach((booking) => {
+      const type = String(booking.roomType || "").trim();
+      if (!type) return;
+      if (!bookingsByType[type]) bookingsByType[type] = [];
+      bookingsByType[type].push(booking);
+    });
+
+    const overridesByRoomType = buildOverrideMapByRoomType(overrides);
+    const selectedDateKeys = hasValidDates
+      ? getDateKeysInRange(checkInDate, checkOutDate)
+      : [];
 
     const rooms = (hotel.rooms || []).map((room) => {
-      const total = Number(room.total) || 0;
-      const booked = bookedByType[room.type] || 0;
-      const available = Math.max(total - booked, 0);
+      const total = Math.max(0, Number(room.total) || 0);
+      const type = String(room.type || "").trim();
+
+      if (!hasValidDates) {
+        return {
+          type: room.type,
+          price: Number(room.price) || 0,
+          total,
+          booked: 0,
+          available: total,
+          level: getAvailabilityLevel(total, total),
+        };
+      }
+
+      const bookedByDate = buildBookedCountByDate(
+        bookingsByType[type] || [],
+        checkInDate,
+        checkOutDate
+      );
+      const overrideByDate = overridesByRoomType[type] || {};
+
+      let minAvailable = Number.POSITIVE_INFINITY;
+      let maxBooked = 0;
+
+      selectedDateKeys.forEach((dateKey) => {
+        const totalForDay =
+          overrideByDate[dateKey] !== undefined ? overrideByDate[dateKey] : total;
+        const bookedForDay = bookedByDate[dateKey] || 0;
+        const availableForDay = Math.max(totalForDay - bookedForDay, 0);
+
+        if (availableForDay < minAvailable) minAvailable = availableForDay;
+        if (bookedForDay > maxBooked) maxBooked = bookedForDay;
+      });
+
+      if (!Number.isFinite(minAvailable)) minAvailable = total;
 
       return {
         type: room.type,
         price: Number(room.price) || 0,
         total,
-        booked,
-        available,
-        level: getAvailabilityLevel(available, total),
+        booked: maxBooked,
+        available: minAvailable,
+        level: getAvailabilityLevel(minAvailable, total),
       };
     });
 
@@ -373,13 +561,32 @@ app.get("/api/hotels/:id/availability-calendar", async (req, res) => {
       checkOut: { $gt: monthStart },
     }).select("checkIn checkOut");
 
-    const totalRooms = Number(room.total) || 0;
+    const overrides = await RoomAvailabilityOverride.find({
+      hotelId: hotel._id,
+      roomType,
+      date: { $gte: monthStart, $lt: monthEnd },
+    }).select("date total");
+
+    const overrideByDate = {};
+    overrides.forEach((override) => {
+      overrideByDate[toDateOnly(override.date)] = Math.max(
+        0,
+        Number(override.total) || 0
+      );
+    });
+
+    const baseTotalRooms = Number(room.total) || 0;
     const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
 
     const days = [];
     for (let day = 1; day <= daysInMonth; day += 1) {
       const dayStart = new Date(Date.UTC(year, month - 1, day));
       const dayEnd = new Date(Date.UTC(year, month - 1, day + 1));
+      const dateKey = toDateOnly(dayStart);
+      const totalRooms =
+        overrideByDate[dateKey] !== undefined
+          ? overrideByDate[dateKey]
+          : baseTotalRooms;
 
       let booked = 0;
       bookings.forEach((booking) => {
@@ -389,7 +596,7 @@ app.get("/api/hotels/:id/availability-calendar", async (req, res) => {
 
       const available = Math.max(totalRooms - booked, 0);
       days.push({
-        date: toDateOnly(dayStart),
+        date: dateKey,
         total: totalRooms,
         booked,
         available,
@@ -401,7 +608,7 @@ app.get("/api/hotels/:id/availability-calendar", async (req, res) => {
       hotelId: hotel._id,
       roomType,
       month: `${year}-${String(month).padStart(2, "0")}`,
-      totalRooms,
+      totalRooms: baseTotalRooms,
       days,
     });
   } catch (err) {
@@ -426,11 +633,11 @@ app.post("/api/bookings", auth, async (req, res) => {
     const room = hotel.rooms.find(r => r.type === roomType);
     if (!room) return res.status(400).json({ msg: "Invalid room type" });
 
-    const checkInDate = new Date(checkIn);
-    const checkOutDate = new Date(checkOut);
+    const checkInDate = toUtcDateStart(checkIn);
+    const checkOutDate = toUtcDateStart(checkOut);
     if (
-      Number.isNaN(checkInDate.getTime()) ||
-      Number.isNaN(checkOutDate.getTime()) ||
+      !checkInDate ||
+      !checkOutDate ||
       checkOutDate <= checkInDate
     ) {
       return res.status(400).json({ msg: "Invalid booking dates" });
@@ -454,16 +661,46 @@ app.post("/api/bookings", auth, async (req, res) => {
       return res.status(400).json({ msg: "Children count must be 0 or more" });
     }
 
-    const overlappingCount = await Booking.countDocuments({
+    const overlappingBookings = await Booking.find({
       hotelId: hotel._id,
       roomType,
       status: { $in: ACTIVE_BOOKING_STATUSES },
       checkIn: { $lt: checkOutDate },
       checkOut: { $gt: checkInDate },
+    }).select("checkIn checkOut");
+
+    const overrides = await RoomAvailabilityOverride.find({
+      hotelId: hotel._id,
+      roomType,
+      date: { $gte: checkInDate, $lt: checkOutDate },
+    }).select("date total");
+
+    const overrideByDate = {};
+    overrides.forEach((override) => {
+      overrideByDate[toDateOnly(override.date)] = Math.max(
+        0,
+        Number(override.total) || 0
+      );
     });
 
-    const totalRooms = Number(room.total) || 0;
-    if (overlappingCount >= totalRooms) {
+    const bookedByDate = buildBookedCountByDate(
+      overlappingBookings,
+      checkInDate,
+      checkOutDate
+    );
+    const stayDateKeys = getDateKeysInRange(checkInDate, checkOutDate);
+    const baseTotalRooms = Math.max(0, Number(room.total) || 0);
+
+    const isUnavailableForAnyDay = stayDateKeys.some((dateKey) => {
+      const totalForDay =
+        overrideByDate[dateKey] !== undefined
+          ? overrideByDate[dateKey]
+          : baseTotalRooms;
+      const bookedForDay = bookedByDate[dateKey] || 0;
+      return bookedForDay >= totalForDay;
+    });
+
+    if (isUnavailableForAnyDay) {
       return res.status(400).json({
         msg: "No vacancies available for selected room type and dates",
       });
