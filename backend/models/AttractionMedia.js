@@ -12,7 +12,19 @@ const attractionPhotoSchema = new mongoose.Schema(
     },
     originalName: String,
     width: Number,
-    height: Number
+    height: Number,
+    focusX: {
+      type: Number,
+      min: 0,
+      max: 100,
+      default: 50
+    },
+    focusY: {
+      type: Number,
+      min: 0,
+      max: 100,
+      default: 50
+    }
   },
   {
     _id: false

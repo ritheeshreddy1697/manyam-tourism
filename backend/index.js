@@ -160,12 +160,20 @@ const toUtcDateStart = (value) => {
 const normalizeAttractionCategory = (value = "") =>
   String(value || "").trim().toLowerCase();
 
+const clampAttractionFocus = (value, fallback = 50) => {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) return fallback;
+  return Math.min(100, Math.max(0, Math.round(numericValue)));
+};
+
 const mapUploadedPhoto = (file) => ({
   url: file.path,
   publicId: file.filename,
   originalName: file.originalname,
   width: Number(file.width) || undefined,
-  height: Number(file.height) || undefined
+  height: Number(file.height) || undefined,
+  focusX: 50,
+  focusY: 50
 });
 
 const destroyCloudinaryPhoto = async (publicId) => {
@@ -571,6 +579,44 @@ app.delete("/api/admin/attractions/media", auth, adminOnly, async (req, res) => 
     res.json(media);
   } catch (err) {
     console.error("ATTRACTION MEDIA DELETE ERROR:", err);
+    res.status(500).json({ msg: "Server error" });
+  }
+});
+
+app.patch("/api/admin/attractions/media", auth, adminOnly, async (req, res) => {
+  try {
+    const category = normalizeAttractionCategory(req.body.category);
+    const slug = String(req.body.slug || "").trim();
+    const publicId = String(req.body.publicId || "").trim();
+
+    if (!ATTRACTION_CATEGORIES.includes(category)) {
+      return res.status(400).json({ msg: "Invalid attraction category" });
+    }
+
+    if (!slug || !publicId) {
+      return res
+        .status(400)
+        .json({ msg: "Attraction slug and photo id are required" });
+    }
+
+    const media = await AttractionMedia.findOne({ category, slug });
+    if (!media) {
+      return res.status(404).json({ msg: "Attraction gallery not found" });
+    }
+
+    const photo = (media.photos || []).find((item) => item.publicId === publicId);
+    if (!photo) {
+      return res.status(404).json({ msg: "Photo not found" });
+    }
+
+    photo.focusX = clampAttractionFocus(req.body.focusX, photo.focusX);
+    photo.focusY = clampAttractionFocus(req.body.focusY, photo.focusY);
+
+    await media.save();
+
+    res.json(media);
+  } catch (err) {
+    console.error("ATTRACTION MEDIA UPDATE ERROR:", err);
     res.status(500).json({ msg: "Server error" });
   }
 });
