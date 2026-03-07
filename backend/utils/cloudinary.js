@@ -8,12 +8,18 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-const storage = new CloudinaryStorage({
-  cloudinary,
-  params: {
-    folder: "manyam-hotels",
-    allowed_formats: ["jpg", "png", "jpeg", "webp"]
-  }
+const createStorage = (folder) =>
+  new CloudinaryStorage({
+    cloudinary,
+    params: {
+      folder,
+      allowed_formats: ["jpg", "png", "jpeg", "webp"]
+    }
+  });
+
+export const hotelUpload = multer({ storage: createStorage("manyam-hotels") });
+export const attractionUpload = multer({
+  storage: createStorage("manyam-attractions")
 });
 
-export const upload = multer({ storage });
+export { cloudinary };
