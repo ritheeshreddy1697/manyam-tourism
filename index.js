@@ -34,7 +34,6 @@ app.use(
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_EMAIL = "sankar.yegireddi@gmail.com";
 const ATTRACTION_CATEGORIES = ["temples", "waterfalls", "viewpoints", "festivals", "gallery"];
-const MAX_ATTRACTION_PHOTOS = 3;
 
 /* ================= FIREBASE ================= */
   
@@ -484,7 +483,7 @@ app.post(
   "/api/admin/attractions/media",
   auth,
   adminOnly,
-  attractionUpload.array("photos", MAX_ATTRACTION_PHOTOS),
+  attractionUpload.array("photos"),
   async (req, res) => {
     try {
       const category = normalizeAttractionCategory(req.body.category);
@@ -506,16 +505,6 @@ app.post(
       }
 
       const existingMedia = await AttractionMedia.findOne({ category, slug });
-      const existingPhotos = Array.isArray(existingMedia?.photos)
-        ? existingMedia.photos
-        : [];
-
-      if (existingPhotos.length + files.length > MAX_ATTRACTION_PHOTOS) {
-        await cleanupUploadedPhotos(files);
-        return res.status(400).json({
-          msg: `Only ${MAX_ATTRACTION_PHOTOS} photos are allowed per attraction`
-        });
-      }
 
       const newPhotos = files.map(mapUploadedPhoto);
       const updatedMedia = await AttractionMedia.findOneAndUpdate(
