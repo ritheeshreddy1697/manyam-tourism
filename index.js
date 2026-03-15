@@ -11,9 +11,14 @@ import User from "./models/User.js";
 import Hotel from "./models/Hotel.js";
 import Booking from "./models/Booking.js";
 import RoomAvailabilityOverride from "./models/RoomAvailabilityOverride.js";
+import AttractionMedia from "./models/AttractionMedia.js";
 import { generateReceipt } from "./utils/receipt.js";
 import { sendReceiptMail } from "./utils/mailer.js";
-import { upload } from "./utils/cloudinary.js";
+import {
+  attractionUpload,
+  cloudinary,
+  hotelUpload
+} from "./utils/cloudinary.js";
 
 /* ================= BASIC SETUP ================= */
 
@@ -27,7 +32,9 @@ app.use(
   })
 );
 const JWT_SECRET = process.env.JWT_SECRET;
-const ADMIN_EMAIL = "manyamtourism@gmail.com";
+const ADMIN_EMAIL = "sankar.yegireddi@gmail.com";
+const ATTRACTION_CATEGORIES = ["temples", "waterfalls", "viewpoints", "festivals", "gallery"];
+const MAX_ATTRACTION_PHOTOS = 3;
 
 /* ================= FIREBASE ================= */
   
@@ -108,6 +115,11 @@ const auth = (req, res, next) => {
   }
 };
 
+const adminOnly = (req, res, next) => {
+  if (req.user.role !== "admin") return res.sendStatus(403);
+  next();
+};
+
 const escapeRegExp = (value = "") =>
   String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -143,6 +155,40 @@ const toUtcDateStart = (value) => {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+};
+
+const normalizeAttractionCategory = (value = "") =>
+  String(value || "").trim().toLowerCase();
+
+const clampAttractionFocus = (value, fallback = 50) => {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) return fallback;
+  return Math.min(100, Math.max(0, Math.round(numericValue)));
+};
+
+const mapUploadedPhoto = (file) => ({
+  url: file.path,
+  publicId: file.filename,
+  originalName: file.originalname,
+  width: Number(file.width) || undefined,
+  height: Number(file.height) || undefined,
+  focusX: 50,
+  focusY: 50
+});
+
+const destroyCloudinaryPhoto = async (publicId) => {
+  if (!publicId) return;
+  try {
+    await cloudinary.uploader.destroy(publicId, { resource_type: "image" });
+  } catch (err) {
+    console.error("CLOUDINARY DELETE ERROR:", err.message);
+  }
+};
+
+const cleanupUploadedPhotos = async (files = []) => {
+  await Promise.all(
+    (files || []).map((file) => destroyCloudinaryPhoto(file?.filename))
+  );
 };
 
 const getDateKeysInRange = (startDate, endDate) => {
@@ -214,6 +260,9 @@ app.post("/api/auth/google", async (req, res) => {
       });
     } else if (isAdmin && user.role !== "admin") {
       user.role = "admin";
+      await user.save();
+    } else if (!isAdmin && user.role === "admin") {
+      user.role = "user";
       await user.save();
     }
 
@@ -394,12 +443,186 @@ app.post("/api/hotel/availability-date", auth, async (req, res) => {
 app.post(
   "/api/hotel/upload-image",
   auth,
-  upload.single("image"),
+  hotelUpload.single("image"),
   async (req, res) => {
     if (req.user.role !== "hotel") return res.sendStatus(403);
     res.json({ url: req.file.path });
   }
 );
+
+app.get("/api/attractions/media", async (req, res) => {
+  try {
+    const category = normalizeAttractionCategory(req.query.category);
+    const slug = String(req.query.slug || "").trim();
+
+    if (category && !ATTRACTION_CATEGORIES.includes(category)) {
+      return res.status(400).json({ msg: "Invalid attraction category" });
+    }
+
+    if (slug && !category) {
+      return res.status(400).json({ msg: "Category is required with slug" });
+    }
+
+    const query = {};
+    if (category) query.category = category;
+    if (slug) query.slug = slug;
+
+    if (slug) {
+      const media = await AttractionMedia.findOne(query).lean();
+      return res.json(media || { category, slug, photos: [] });
+    }
+
+    const media = await AttractionMedia.find(query).sort({ updatedAt: -1 }).lean();
+    res.json(media);
+  } catch (err) {
+    console.error("ATTRACTION MEDIA FETCH ERROR:", err);
+    res.status(500).json({ msg: "Server error" });
+  }
+});
+
+app.post(
+  "/api/admin/attractions/media",
+  auth,
+  adminOnly,
+  attractionUpload.array("photos", MAX_ATTRACTION_PHOTOS),
+  async (req, res) => {
+    try {
+      const category = normalizeAttractionCategory(req.body.category);
+      const slug = String(req.body.slug || "").trim();
+      const files = Array.isArray(req.files) ? req.files : [];
+
+      if (!ATTRACTION_CATEGORIES.includes(category)) {
+        await cleanupUploadedPhotos(files);
+        return res.status(400).json({ msg: "Invalid attraction category" });
+      }
+
+      if (!slug) {
+        await cleanupUploadedPhotos(files);
+        return res.status(400).json({ msg: "Attraction slug is required" });
+      }
+
+      if (files.length === 0) {
+        return res.status(400).json({ msg: "Select at least one photo" });
+      }
+
+      const existingMedia = await AttractionMedia.findOne({ category, slug });
+      const existingPhotos = Array.isArray(existingMedia?.photos)
+        ? existingMedia.photos
+        : [];
+
+      if (existingPhotos.length + files.length > MAX_ATTRACTION_PHOTOS) {
+        await cleanupUploadedPhotos(files);
+        return res.status(400).json({
+          msg: `Only ${MAX_ATTRACTION_PHOTOS} photos are allowed per attraction`
+        });
+      }
+
+      const newPhotos = files.map(mapUploadedPhoto);
+      const updatedMedia = await AttractionMedia.findOneAndUpdate(
+        { category, slug },
+        {
+          $setOnInsert: { category, slug },
+          $push: { photos: { $each: newPhotos } }
+        },
+        {
+          new: true,
+          upsert: true,
+          setDefaultsOnInsert: true
+        }
+      );
+
+      res.json(updatedMedia);
+    } catch (err) {
+      await cleanupUploadedPhotos(req.files);
+      console.error("ATTRACTION MEDIA UPLOAD ERROR:", err);
+      res.status(500).json({ msg: "Server error" });
+    }
+  }
+);
+
+app.delete("/api/admin/attractions/media", auth, adminOnly, async (req, res) => {
+  try {
+    const category = normalizeAttractionCategory(req.body.category);
+    const slug = String(req.body.slug || "").trim();
+    const publicId = String(req.body.publicId || "").trim();
+
+    if (!ATTRACTION_CATEGORIES.includes(category)) {
+      return res.status(400).json({ msg: "Invalid attraction category" });
+    }
+
+    if (!slug || !publicId) {
+      return res
+        .status(400)
+        .json({ msg: "Attraction slug and photo id are required" });
+    }
+
+    const media = await AttractionMedia.findOne({ category, slug });
+    if (!media) {
+      return res.status(404).json({ msg: "Attraction gallery not found" });
+    }
+
+    const remainingPhotos = (media.photos || []).filter(
+      (photo) => photo.publicId !== publicId
+    );
+
+    if (remainingPhotos.length === media.photos.length) {
+      return res.status(404).json({ msg: "Photo not found" });
+    }
+
+    await destroyCloudinaryPhoto(publicId);
+
+    if (remainingPhotos.length === 0) {
+      await AttractionMedia.deleteOne({ _id: media._id });
+      return res.json({ category, slug, photos: [] });
+    }
+
+    media.photos = remainingPhotos;
+    await media.save();
+
+    res.json(media);
+  } catch (err) {
+    console.error("ATTRACTION MEDIA DELETE ERROR:", err);
+    res.status(500).json({ msg: "Server error" });
+  }
+});
+
+app.patch("/api/admin/attractions/media", auth, adminOnly, async (req, res) => {
+  try {
+    const category = normalizeAttractionCategory(req.body.category);
+    const slug = String(req.body.slug || "").trim();
+    const publicId = String(req.body.publicId || "").trim();
+
+    if (!ATTRACTION_CATEGORIES.includes(category)) {
+      return res.status(400).json({ msg: "Invalid attraction category" });
+    }
+
+    if (!slug || !publicId) {
+      return res
+        .status(400)
+        .json({ msg: "Attraction slug and photo id are required" });
+    }
+
+    const media = await AttractionMedia.findOne({ category, slug });
+    if (!media) {
+      return res.status(404).json({ msg: "Attraction gallery not found" });
+    }
+
+    const photo = (media.photos || []).find((item) => item.publicId === publicId);
+    if (!photo) {
+      return res.status(404).json({ msg: "Photo not found" });
+    }
+
+    photo.focusX = clampAttractionFocus(req.body.focusX, photo.focusX);
+    photo.focusY = clampAttractionFocus(req.body.focusY, photo.focusY);
+
+    await media.save();
+
+    res.json(media);
+  } catch (err) {
+    console.error("ATTRACTION MEDIA UPDATE ERROR:", err);
+    res.status(500).json({ msg: "Server error" });
+  }
+});
 
 /* ================= PUBLIC ================= */
 
